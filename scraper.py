@@ -138,12 +138,39 @@ if not os.path.exists(csv_filename):
     with open(csv_filename, "w", encoding="utf-8") as f:
         f.write("timestamp,multiplier,color\n")
 
+# --- Watchdog: restart the container if scraping silently stalls ---
+# The main loop swallows errors, and a crashed/frozen browser can make it hang forever
+# without exiting, so Railway never restarts it. This thread force-exits so Railway restarts it.
+HEARTBEAT_TIMEOUT_SECONDS = 120    # no successful read of the history list
+NO_NEW_ROW_TIMEOUT_SECONDS = 600   # no new row written to the CSV
+heartbeat = {"ok": time.time()}
+
+
+def watchdog():
+    last_size = os.path.getsize(csv_filename) if os.path.exists(csv_filename) else 0
+    last_growth = time.time()
+    while True:
+        time.sleep(15)
+        now = time.time()
+        size = os.path.getsize(csv_filename) if os.path.exists(csv_filename) else 0
+        if size != last_size:
+            last_size, last_growth = size, now
+        if now - heartbeat["ok"] > HEARTBEAT_TIMEOUT_SECONDS:
+            print(f"WATCHDOG: browser unresponsive for {int(now - heartbeat['ok'])}s. Restarting.", flush=True)
+            os._exit(1)
+        if now - last_growth > NO_NEW_ROW_TIMEOUT_SECONDS:
+            print(f"WATCHDOG: no new rows for {int(now - last_growth)}s. Restarting.", flush=True)
+            os._exit(1)
+
+
 start_csv_server()
 
 with Stealth().use_sync(sync_playwright()) as p:
     print("Initial startup: Launching Primary Active Browser (Browser A)...")
     current_browser, current_context, current_page, active_history_frame = initialize_new_browser_flow(p, show_browser)
     print("Browser A successfully engaged and online.")
+    heartbeat["ok"] = time.time()
+    threading.Thread(target=watchdog, daemon=True).start()
 
     last_processed_multipliers = []
     next_rotation_target = time.time() + (ROTATE_INTERVAL_MINUTES * 60)
@@ -153,6 +180,7 @@ with Stealth().use_sync(sync_playwright()) as p:
     pending_page = None
     pending_history_frame = None
     rotation_in_progress = False
+    last_error_log = 0
 
     print("Starting infinite intersection-matching loop. Press Ctrl+C to stop.")
 
@@ -192,6 +220,7 @@ with Stealth().use_sync(sync_playwright()) as p:
                 """)
 
                 if history_list:
+                    heartbeat["ok"] = time.time()
                     latest_live_item = history_list[0]["mult"].replace('x', '').strip()
                     latest_live_color = history_list[0]["bg"]
 
@@ -306,9 +335,12 @@ with Stealth().use_sync(sync_playwright()) as p:
             except KeyboardInterrupt:
                 print("\nScraping stopped by user.")
                 break
-            except Exception:
-                pass
-            current_page.wait_for_timeout(1)
+            except Exception as loop_err:
+                now_err = time.time()
+                if now_err - last_error_log > 30:
+                    print(f"Scrape loop error: {str(loop_err)[:200]}", flush=True)
+                    last_error_log = now_err
+            current_page.wait_for_timeout(300)
 
     try:
         current_context.close()
