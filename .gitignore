@@ -1,1 +1,5 @@
-
+results.csv
+__pycache__/
+*.pyc
+.venv/
+*.log
