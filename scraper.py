@@ -1,5 +1,7 @@
 import os
 import time
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from datetime import datetime
 from playwright.sync_api import sync_playwright
 from playwright_stealth import Stealth
@@ -13,6 +15,39 @@ ROTATE_INTERVAL_MINUTES = 120
 csv_dir = os.path.dirname(csv_filename)
 if csv_dir and not os.path.exists(csv_dir):
     os.makedirs(csv_dir, exist_ok=True)
+
+
+class CsvHandler(BaseHTTPRequestHandler):
+    """Serves the results CSV so it can be viewed/downloaded from the service's public URL."""
+
+    def do_GET(self):
+        path = self.path.split("?")[0]
+        if path in ("/", "/results.csv"):
+            try:
+                with open(csv_filename, "rb") as f:
+                    body = f.read()
+            except FileNotFoundError:
+                body = b"timestamp,multiplier,color\n"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/csv; charset=utf-8")
+            if path == "/results.csv" and "download" in self.path:
+                self.send_header("Content-Disposition", 'attachment; filename="results.csv"')
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def log_message(self, *args):
+        pass
+
+
+def start_csv_server():
+    port = int(os.getenv("PORT", "8080"))
+    server = ThreadingHTTPServer(("0.0.0.0", port), CsvHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    print(f"CSV available over HTTP on port {port} at /results.csv", flush=True)
 
 
 def convert_rgb_to_name(rgb_string):
@@ -89,6 +124,8 @@ def initialize_new_browser_flow(playwright_instance, show_window):
 if not os.path.exists(csv_filename):
     with open(csv_filename, "w", encoding="utf-8") as f:
         f.write("timestamp,multiplier,color\n")
+
+start_csv_server()
 
 with Stealth().use_sync(sync_playwright()) as p:
     print("Initial startup: Launching Primary Active Browser (Browser A)...")
