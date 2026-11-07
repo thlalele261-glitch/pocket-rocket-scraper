@@ -185,9 +185,12 @@ HISTORY_JS = """
 }
 """
 
-# Restart the (single) browser after this many seconds of continuous read errors.
+# Restart the (single) browser after this many seconds of continuous read errors,
+# or when no new multiplier has appeared for this long.
 BROWSER_ERROR_RESTART_SECONDS = 20
+NO_MULTIPLIER_RESTART_SECONDS = 180
 RELAUNCH_RETRY_SECONDS = 10
+MAX_TRACKED_ROWS = 100
 
 
 def close_browser_quietly(browser_obj):
@@ -202,27 +205,76 @@ def now_str():
     return datetime.now(LESOTHO_TZ).strftime("%Y-%m-%d %H:%M:%S")
 
 
+def load_recent_rows_from_csv():
+    """Seed the de-duplication memory from the CSV so a container restart does not re-write rounds."""
+    rows = []
+    try:
+        with open(csv_filename, "r", encoding="utf-8") as f:
+            for line in f.read().splitlines()[1:]:
+                parts = line.split(",", 2)
+                if len(parts) == 3:
+                    rows.append((parts[1], parts[2]))
+    except FileNotFoundError:
+        pass
+    return rows[-MAX_TRACKED_ROWS:]
+
+
+def find_new_rows(recorded, history_oldest_first):
+    """Match what we already recorded against the visible history (overlap) and return the new rows.
+
+    recorded: list of (mult, color) oldest -> newest.
+    history_oldest_first: visible rounds oldest -> newest.
+    Returns (new_rows, overlap_found). We look for the position in the history where our most recent
+    recorded rounds line up (the longest matching tail wins; on a tie the newest position wins) and
+    return everything after it.
+    """
+    best_end, best_len = None, 0
+    for end in range(len(history_oldest_first) - 1, -1, -1):
+        length = 0
+        while (
+            length < len(recorded)
+            and end - length >= 0
+            and history_oldest_first[end - length] == recorded[-1 - length]
+        ):
+            length += 1
+        if length == 0:
+            continue
+        # Valid if the match runs back to the start of the visible history, covers every round we
+        # have recorded, or is at least 3 rounds long (a strong enough signature on its own).
+        if length == end + 1 or length == len(recorded) or length >= 3:
+            if length > best_len:
+                best_end, best_len = end, length
+    if best_end is None:
+        return None, False
+    return history_oldest_first[best_end + 1:], True
+
+
 with Stealth().use_sync(sync_playwright()) as p:
-    # Only ONE browser is ever open (memory is limited). If it crashes or stops
-    # responding it is closed and a fresh one is started; the CSV is never touched.
+    # Only ONE browser is ever open (memory is limited). If it crashes, stops responding, or no new
+    # multiplier appears for 3 minutes, it is closed and a fresh one is started; the CSV is never
+    # touched. On every (re)start the whole visible history is read and matched against what is
+    # already recorded, so rounds missed during the outage are filled in without duplicates.
     browser = page = frame = None
     page_state = {"crashed": False}
-    last_processed_multipliers = []
+    recorded_rows = load_recent_rows_from_csv()
     first_error_time = None
     last_error_log = 0
+    last_new_row_time = time.time()
     browser_launches = 0
+    needs_initial_sync = True
 
-    print("Starting scraper. Press Ctrl+C to stop.", flush=True)
+    print(f"Starting scraper with {len(recorded_rows)} rows already on file. Press Ctrl+C to stop.", flush=True)
 
     with open(csv_filename, "a", encoding="utf-8") as csv_file:
 
-        def write_row(mult, bg):
-            color_name = convert_rgb_to_name(bg)
+        def write_row(mult, color_name):
+            global last_new_row_time
             log_line = f"{now_str()},{mult},{color_name}\n"
             print(log_line.strip(), flush=True)
             csv_file.write(log_line)
             csv_file.flush()
-            last_processed_multipliers.append({"mult": mult, "bg": bg})
+            recorded_rows.append((mult, color_name))
+            last_new_row_time = time.time()
 
         threading.Thread(target=watchdog, daemon=True).start()
 
@@ -243,43 +295,57 @@ with Stealth().use_sync(sync_playwright()) as p:
                     page_state["crashed"] = False
                     page.on("crash", lambda *_: page_state.update(crashed=True))
                     first_error_time = None
+                    needs_initial_sync = True
+                    last_new_row_time = time.time()
                     heartbeat["ok"] = time.time()
                     print("Browser online.", flush=True)
 
                 if page_state["crashed"] or page.is_closed() or not browser.is_connected():
                     raise RuntimeError("browser or page crashed")
 
+                # --- No multiplier for 3 minutes: replace the browser ---
+                if time.time() - last_new_row_time > NO_MULTIPLIER_RESTART_SECONDS:
+                    print(f"No new multiplier for {NO_MULTIPLIER_RESTART_SECONDS}s. Closing browser and starting a fresh one.", flush=True)
+                    close_browser_quietly(browser)
+                    browser = page = frame = None
+                    continue
+
                 history_list = frame.evaluate(HISTORY_JS)
                 first_error_time = None
 
                 if history_list:
                     heartbeat["ok"] = time.time()
-                    latest_mult = history_list[0]["mult"].replace("x", "").strip()
-                    latest_bg = history_list[0]["bg"]
+                    # Newest is index 0 on the page; reverse so we always work oldest -> newest.
+                    visible = [
+                        (item["mult"].replace("x", "").strip(), convert_rgb_to_name(item["bg"]))
+                        for item in reversed(history_list)
+                    ]
 
-                    match_index = -1
-                    if last_processed_multipliers:
-                        last_known_top = last_processed_multipliers[-1]
-                        for idx, item in enumerate(history_list):
-                            clean_m = item["mult"].replace("x", "").strip()
-                            if clean_m == last_known_top["mult"] and item["bg"] == last_known_top["bg"]:
-                                match_index = idx
-                                break
+                    if not recorded_rows:
+                        # Nothing recorded yet: ingest the entire visible history, oldest first.
+                        print(f"Empty file: writing all {len(visible)} visible rounds.", flush=True)
+                        for mult, color_name in visible:
+                            write_row(mult, color_name)
+                        needs_initial_sync = False
+                    else:
+                        new_rows, overlap_found = find_new_rows(recorded_rows, visible)
+                        if overlap_found:
+                            if needs_initial_sync and new_rows:
+                                print(f"Recovered {len(new_rows)} round(s) missed while the browser was down.", flush=True)
+                            for mult, color_name in new_rows:
+                                write_row(mult, color_name)
+                            needs_initial_sync = False
+                        elif needs_initial_sync:
+                            # Gap is longer than the visible history: everything visible is newer, keep all of it.
+                            print(f"No overlap with recorded rounds after restart: writing all {len(visible)} visible rounds.", flush=True)
+                            for mult, color_name in visible:
+                                write_row(mult, color_name)
+                            needs_initial_sync = False
+                        # else: no overlap in steady state (e.g. a half-rendered read). Do not close the
+                        # browser; just keep polling. The 3-minute no-multiplier rule is the safety net.
 
-                    if not last_processed_multipliers:
-                        # First read ever: record the latest round as the anchor.
-                        write_row(latest_mult, latest_bg)
-                    elif match_index == -1:
-                        # Gap longer than the visible history (e.g. after a browser restart): re-anchor.
-                        print("Resync: previous round no longer in history, re-anchoring.", flush=True)
-                        write_row(latest_mult, latest_bg)
-                    elif match_index > 0:
-                        # Write every round newer than the last one we recorded, oldest first.
-                        for i in range(match_index - 1, -1, -1):
-                            write_row(history_list[i]["mult"].replace("x", "").strip(), history_list[i]["bg"])
-
-                    if len(last_processed_multipliers) > 100:
-                        last_processed_multipliers = last_processed_multipliers[-100:]
+                    if len(recorded_rows) > MAX_TRACKED_ROWS:
+                        del recorded_rows[:-MAX_TRACKED_ROWS]
 
             except KeyboardInterrupt:
                 print("\nScraping stopped by user.")
