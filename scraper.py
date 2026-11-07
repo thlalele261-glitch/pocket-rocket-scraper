@@ -2,7 +2,7 @@ import os
 import time
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from playwright.sync_api import sync_playwright
 from playwright_stealth import Stealth
 
@@ -10,6 +10,8 @@ from playwright_stealth import Stealth
 show_browser = os.getenv("SHOW_BROWSER", "false").lower() == "true"
 csv_filename = os.getenv("CSV_PATH", "/data/results.csv")
 ROTATE_INTERVAL_MINUTES = 120
+# Lesotho time (SAST, UTC+2, no daylight saving)
+LESOTHO_TZ = timezone(timedelta(hours=2))
 
 # Make sure the CSV directory exists (volume mount)
 csv_dir = os.path.dirname(csv_filename)
@@ -122,7 +124,7 @@ def initialize_new_browser_flow(playwright_instance, show_window):
 
 
 # One-time clean start: change RESET_ID to wipe the CSV once on the next deploy.
-RESET_ID = "2026-11-07-clean-start"
+RESET_ID = "2026-11-07-lesotho-time"
 reset_marker = os.path.join(csv_dir or ".", ".reset_id")
 previous_reset = open(reset_marker).read().strip() if os.path.exists(reset_marker) else None
 if previous_reset != RESET_ID:
@@ -194,7 +196,7 @@ with Stealth().use_sync(sync_playwright()) as p:
                     latest_live_color = history_list[0]["bg"]
 
                     if not last_processed_multipliers:
-                        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        timestamp = datetime.now(LESOTHO_TZ).strftime("%Y-%m-%d %H:%M:%S")
                         color_name = convert_rgb_to_name(latest_live_color)
                         log_line = f"{timestamp},{latest_live_item},{color_name}\n"
                         print(log_line.strip())
@@ -216,7 +218,7 @@ with Stealth().use_sync(sync_playwright()) as p:
                             new_mult = history_list[i]["mult"].replace('x', '').strip()
                             new_color = history_list[i]["bg"]
 
-                            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                            timestamp = datetime.now(LESOTHO_TZ).strftime("%Y-%m-%d %H:%M:%S")
                             color_name = convert_rgb_to_name(new_color)
 
                             log_line = f"{timestamp},{new_mult},{color_name}\n"
@@ -271,7 +273,7 @@ with Stealth().use_sync(sync_playwright()) as p:
                                 for i in range(matched_offset - 1, -1, -1):
                                     missed_mult = res_b[i]["mult"].replace('x', '').strip()
                                     missed_color = res_b[i]["bg"]
-                                    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                                    timestamp = datetime.now(LESOTHO_TZ).strftime("%Y-%m-%d %H:%M:%S")
                                     color_name = convert_rgb_to_name(missed_color)
                                     log_line = f"{timestamp},{missed_mult},{color_name}\n"
                                     print(log_line.strip())
