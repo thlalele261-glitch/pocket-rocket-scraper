@@ -121,6 +121,17 @@ def initialize_new_browser_flow(playwright_instance, show_window):
     return browser_obj, context_obj, page_obj, target_frame
 
 
+# One-time clean start: change RESET_ID to wipe the CSV once on the next deploy.
+RESET_ID = "2026-11-07-clean-start"
+reset_marker = os.path.join(csv_dir or ".", ".reset_id")
+previous_reset = open(reset_marker).read().strip() if os.path.exists(reset_marker) else None
+if previous_reset != RESET_ID:
+    if os.path.exists(csv_filename):
+        os.remove(csv_filename)
+        print("Previous results.csv deleted for a clean start.", flush=True)
+    with open(reset_marker, "w") as f:
+        f.write(RESET_ID)
+
 if not os.path.exists(csv_filename):
     with open(csv_filename, "w", encoding="utf-8") as f:
         f.write("timestamp,multiplier,color\n")
