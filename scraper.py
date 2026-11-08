@@ -1,9 +1,10 @@
 import os
 import time
+import asyncio
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from datetime import datetime, timedelta, timezone
-from playwright.sync_api import sync_playwright
+from playwright.async_api import async_playwright
 
 # --- Railway-friendly configuration ---
 show_browser = os.getenv("SHOW_BROWSER", "false").lower() == "true"
@@ -63,9 +64,9 @@ def convert_rgb_to_name(rgb_string):
     return "Black"
 
 
-def initialize_new_browser_flow(playwright_instance, show_window):
-    """Launch mobile Chromium + navigate to game iframe (no stealth)."""
-    browser_obj = playwright_instance.chromium.launch(
+async def initialize_new_browser_flow(playwright_instance, show_window):
+    """Launch mobile Chromium + navigate to game iframe. Fully async — no greenlet risk."""
+    browser_obj = await playwright_instance.chromium.launch(
         headless=not show_window,
         args=[
             "--no-sandbox",
@@ -81,25 +82,25 @@ def initialize_new_browser_flow(playwright_instance, show_window):
     )
     try:
         mobile_device = playwright_instance.devices['iPhone 13']
-        context_obj = browser_obj.new_context(**mobile_device)
-        page_obj = context_obj.new_page()
+        context_obj = await browser_obj.new_context(**mobile_device)
+        page_obj = await context_obj.new_page()
 
-        page_obj.goto("https://www.simacombet.com/pocket-rocket", timeout=45000)
+        await page_obj.goto("https://www.simacombet.com/pocket-rocket", timeout=45000)
 
         try:
-            page_obj.wait_for_selector('.n-i.n-i-close-a', timeout=10000)
-            page_obj.wait_for_timeout(1500)
-            page_obj.click('.n-i.n-i-close-a', delay=150)
+            await page_obj.wait_for_selector('.n-i.n-i-close-a', timeout=10000)
+            await page_obj.wait_for_timeout(1500)
+            await page_obj.click('.n-i.n-i-close-a', delay=150)
         except Exception:
             pass
 
         outer_frame = page_obj.frame_locator("#NVNVPocketRocket")
         tap_element = outer_frame.get_by_text("Tap anywhere to start!")
 
-        tap_element.wait_for(state="visible", timeout=25000)
-        page_obj.wait_for_timeout(1500)
-        tap_element.click(delay=150)
-        page_obj.wait_for_timeout(5000)
+        await tap_element.wait_for(state="visible", timeout=25000)
+        await page_obj.wait_for_timeout(1500)
+        await tap_element.click(delay=150)
+        await page_obj.wait_for_timeout(5000)
 
         target_frame = next(
             (f for f in page_obj.frames if "games-client-pocket-rocket.nsoft.app" in f.url),
@@ -108,30 +109,30 @@ def initialize_new_browser_flow(playwright_instance, show_window):
 
         if target_frame is None:
             try:
-                browser_obj.close()
+                await browser_obj.close()
             except Exception:
                 pass
             raise RuntimeError("Failed to locate target engine iframe stream.")
 
         if not show_window:
-            def block_assets(route):
+            async def block_assets(route):
                 if route.request.resource_type in ["image", "stylesheet", "media", "font"]:
-                    route.abort()
+                    await route.abort()
                 else:
-                    route.continue_()
-            page_obj.route("**/*", block_assets)
+                    await route.continue_()
+            await page_obj.route("**/*", block_assets)
 
         return browser_obj, context_obj, page_obj, target_frame
     except Exception:
         try:
-            browser_obj.close()
+            await browser_obj.close()
         except Exception:
             pass
         raise
 
 
 # --- One-time reset for this version ---
-RESET_ID = "2026-11-08-native-timeout"
+RESET_ID = "2026-11-08-async"
 reset_marker = os.path.join(csv_dir or ".", ".reset_id")
 previous_reset = open(reset_marker).read().strip() if os.path.exists(reset_marker) else None
 if previous_reset != RESET_ID:
@@ -143,7 +144,7 @@ if not os.path.exists(csv_filename):
         f.write("timestamp,multiplier,color\n")
 
 
-# --- Watchdog (soft reset only) ---
+# --- Watchdog (soft reset via asyncio-safe flag) ---
 HEARTBEAT_TIMEOUT_SECONDS = 45
 NO_NEW_ROW_TIMEOUT_SECONDS = 600
 
@@ -172,9 +173,7 @@ def watchdog():
 
 start_csv_server()
 
-# Runs inside the sync-thread's event loop -> no greenlet error.
-# wait_for_function supports a native timeout and returns whatever the JS returns.
-HISTORY_WAIT_JS = """
+HISTORY_JS = """
 () => {
     const wrapper = document.querySelector('.rounds-history-inner-wrapper');
     if (!wrapper) return null;
@@ -198,15 +197,15 @@ BROWSER_ERROR_RESTART_SECONDS = 20
 NO_MULTIPLIER_RESTART_SECONDS = 180
 RELAUNCH_RETRY_SECONDS = 10
 MAX_TRACKED_ROWS = 100
-EVALUATE_TIMEOUT_MS = 15000
+EVALUATE_TIMEOUT_SECONDS = 15
 
 
-def close_browser_quietly(browser_obj):
+async def safe_evaluate(frame, script, timeout=EVALUATE_TIMEOUT_SECONDS):
+    """Async evaluate with a real asyncio.wait_for timeout. No greenlets, no hangs."""
     try:
-        if browser_obj:
-            browser_obj.close()
-    except Exception:
-        pass
+        return await asyncio.wait_for(frame.evaluate(script), timeout=timeout)
+    except asyncio.TimeoutError:
+        raise RuntimeError("evaluate() timeout — browser hung")
 
 
 def now_str():
@@ -246,22 +245,23 @@ def find_new_rows(recorded, history_oldest_first):
     return history_oldest_first[best_end + 1:], True
 
 
-with sync_playwright() as p:
-    browser = page = frame = None
-    page_state = {"crashed": False}
-    recorded_rows = load_recent_rows_from_csv()
-    first_error_time = None
-    last_error_log = 0
-    last_new_row_time = time.time()
-    browser_launches = 0
-    needs_initial_sync = True
+async def main_loop():
+    async with async_playwright() as p:
+        browser = page = frame = None
+        page_state = {"crashed": False}
+        recorded_rows = load_recent_rows_from_csv()
+        first_error_time = None
+        last_error_log = 0
+        last_new_row_time = time.time()
+        browser_launches = 0
+        needs_initial_sync = True
 
-    print(f"Starting scraper with {len(recorded_rows)} rows already on file. Press Ctrl+C to stop.", flush=True)
+        print(f"Starting scraper with {len(recorded_rows)} rows already on file. Press Ctrl+C to stop.", flush=True)
 
-    with open(csv_filename, "a", encoding="utf-8") as csv_file:
+        csv_file = open(csv_filename, "a", encoding="utf-8")
 
         def write_row(mult, color_name):
-            global last_new_row_time
+            nonlocal last_new_row_time
             log_line = f"{now_str()},{mult},{color_name}\n"
             print(log_line.strip(), flush=True)
             csv_file.write(log_line)
@@ -269,113 +269,119 @@ with sync_playwright() as p:
             recorded_rows.append((mult, color_name))
             last_new_row_time = time.time()
 
-        threading.Thread(target=watchdog, daemon=True).start()
-
-        while True:
-            try:
-                # --- Watchdog requested a soft recycle ---
-                if recycle_requested["flag"]:
-                    recycle_requested["flag"] = False
-                    print("Recycling browser per watchdog request.", flush=True)
-                    close_browser_quietly(browser)
-                    browser = page = frame = None
-                    continue
-
-                # --- (Re)start the single browser when there is none ---
-                if browser is None:
-                    heartbeat["ok"] = time.time()
-                    browser_launches += 1
-                    print(f"Launching browser (start #{browser_launches})...", flush=True)
-                    try:
-                        browser, _context, page, frame = initialize_new_browser_flow(p, show_browser)
-                    except Exception as launch_err:
-                        browser = page = frame = None
-                        print(f"Browser launch failed: {str(launch_err)[:200]}. Retrying in {RELAUNCH_RETRY_SECONDS}s.", flush=True)
-                        time.sleep(RELAUNCH_RETRY_SECONDS)
-                        continue
-                    page_state["crashed"] = False
-                    page.on("crash", lambda *_: page_state.update(crashed=True))
-                    first_error_time = None
-                    needs_initial_sync = True
-                    last_new_row_time = time.time()
-                    heartbeat["ok"] = time.time()
-                    print("Browser online.", flush=True)
-
-                if page_state["crashed"] or page.is_closed() or not browser.is_connected():
-                    raise RuntimeError("browser or page crashed")
-
-                if time.time() - last_new_row_time > NO_MULTIPLIER_RESTART_SECONDS:
-                    print(f"No new multiplier for {NO_MULTIPLIER_RESTART_SECONDS}s. Recycling browser.", flush=True)
-                    close_browser_quietly(browser)
-                    browser = page = frame = None
-                    continue
-
-                # Native-timeout evaluate — runs in the sync thread, so no greenlet error.
-                # wait_for_function blocks until the JS returns non-null OR the timeout fires.
+        try:
+            while True:
                 try:
-                    handle = frame.wait_for_function(
-                        HISTORY_WAIT_JS,
-                        timeout=EVALUATE_TIMEOUT_MS,
-                        polling=300,   # polls every 300 ms internally
-                    )
-                    history_list = handle.json_value() if handle else None
-                except Exception as eval_err:
-                    if "Timeout" in type(eval_err).__name__ or "timeout" in str(eval_err).lower():
-                        raise RuntimeError("evaluate() timeout — browser hung")
-                    raise
+                    if recycle_requested["flag"]:
+                        recycle_requested["flag"] = False
+                        print("Recycling browser per watchdog request.", flush=True)
+                        if browser:
+                            try:
+                                await browser.close()
+                            except Exception:
+                                pass
+                        browser = page = frame = None
+                        continue
 
-                first_error_time = None
+                    if browser is None:
+                        heartbeat["ok"] = time.time()
+                        browser_launches += 1
+                        print(f"Launching browser (start #{browser_launches})...", flush=True)
+                        try:
+                            browser, _context, page, frame = await initialize_new_browser_flow(p, show_browser)
+                        except Exception as launch_err:
+                            browser = page = frame = None
+                            print(f"Browser launch failed: {str(launch_err)[:200]}. Retrying in {RELAUNCH_RETRY_SECONDS}s.", flush=True)
+                            await asyncio.sleep(RELAUNCH_RETRY_SECONDS)
+                            continue
+                        page_state["crashed"] = False
+                        page.on("crash", lambda *_: page_state.update(crashed=True))
+                        first_error_time = None
+                        needs_initial_sync = True
+                        last_new_row_time = time.time()
+                        heartbeat["ok"] = time.time()
+                        print("Browser online.", flush=True)
 
-                if history_list:
-                    heartbeat["ok"] = time.time()
-                    visible = [
-                        (item["mult"].replace("x", "").strip(), convert_rgb_to_name(item["bg"]))
-                        for item in reversed(history_list)
-                    ]
+                    if page_state["crashed"] or page.is_closed() or not browser.is_connected():
+                        raise RuntimeError("browser or page crashed")
 
-                    if not recorded_rows:
-                        print(f"Empty file: writing all {len(visible)} visible rounds.", flush=True)
-                        for mult, color_name in visible:
-                            write_row(mult, color_name)
-                        needs_initial_sync = False
-                    else:
-                        new_rows, overlap_found = find_new_rows(recorded_rows, visible)
-                        if overlap_found:
-                            if needs_initial_sync and new_rows:
-                                print(f"Recovered {len(new_rows)} round(s) missed while browser was down.", flush=True)
-                            for mult, color_name in new_rows:
-                                write_row(mult, color_name)
-                            needs_initial_sync = False
-                        elif needs_initial_sync:
-                            print(f"No overlap after restart: writing all {len(visible)} visible rounds.", flush=True)
+                    if time.time() - last_new_row_time > NO_MULTIPLIER_RESTART_SECONDS:
+                        print(f"No new multiplier for {NO_MULTIPLIER_RESTART_SECONDS}s. Recycling browser.", flush=True)
+                        try:
+                            await browser.close()
+                        except Exception:
+                            pass
+                        browser = page = frame = None
+                        continue
+
+                    history_list = await safe_evaluate(frame, HISTORY_JS, timeout=EVALUATE_TIMEOUT_SECONDS)
+                    first_error_time = None
+
+                    if history_list:
+                        heartbeat["ok"] = time.time()
+                        visible = [
+                            (item["mult"].replace("x", "").strip(), convert_rgb_to_name(item["bg"]))
+                            for item in reversed(history_list)
+                        ]
+
+                        if not recorded_rows:
+                            print(f"Empty file: writing all {len(visible)} visible rounds.", flush=True)
                             for mult, color_name in visible:
                                 write_row(mult, color_name)
                             needs_initial_sync = False
+                        else:
+                            new_rows, overlap_found = find_new_rows(recorded_rows, visible)
+                            if overlap_found:
+                                if needs_initial_sync and new_rows:
+                                    print(f"Recovered {len(new_rows)} round(s) missed while browser was down.", flush=True)
+                                for mult, color_name in new_rows:
+                                    write_row(mult, color_name)
+                                needs_initial_sync = False
+                            elif needs_initial_sync:
+                                print(f"No overlap after restart: writing all {len(visible)} visible rounds.", flush=True)
+                                for mult, color_name in visible:
+                                    write_row(mult, color_name)
+                                needs_initial_sync = False
 
-                    if len(recorded_rows) > MAX_TRACKED_ROWS:
-                        del recorded_rows[:-MAX_TRACKED_ROWS]
+                        if len(recorded_rows) > MAX_TRACKED_ROWS:
+                            del recorded_rows[:-MAX_TRACKED_ROWS]
 
-            except KeyboardInterrupt:
-                print("\nScraping stopped by user.")
-                break
-            except Exception as loop_err:
-                now_err = time.time()
-                if now_err - last_error_log > 30:
-                    print(f"Scrape loop error: {str(loop_err)[:200]}", flush=True)
-                    last_error_log = now_err
-                if first_error_time is None:
-                    first_error_time = now_err
-                browser_dead = (
-                    page_state["crashed"]
-                    or "crashed" in str(loop_err).lower()
-                    or "closed" in str(loop_err).lower()
-                    or "timeout" in str(loop_err).lower()
-                )
-                if browser_dead or now_err - first_error_time > BROWSER_ERROR_RESTART_SECONDS:
-                    print("Browser crashed or unresponsive. Recycling (data kept).", flush=True)
-                    close_browser_quietly(browser)
-                    browser = page = frame = None
+                except Exception as loop_err:
+                    now_err = time.time()
+                    if now_err - last_error_log > 30:
+                        print(f"Scrape loop error: {str(loop_err)[:200]}", flush=True)
+                        last_error_log = now_err
+                    if first_error_time is None:
+                        first_error_time = now_err
+                    browser_dead = (
+                        page_state["crashed"]
+                        or "crashed" in str(loop_err).lower()
+                        or "closed" in str(loop_err).lower()
+                        or "timeout" in str(loop_err).lower()
+                    )
+                    if browser_dead or now_err - first_error_time > BROWSER_ERROR_RESTART_SECONDS:
+                        print("Browser crashed or unresponsive. Recycling (data kept).", flush=True)
+                        if browser:
+                            try:
+                                await browser.close()
+                            except Exception:
+                                pass
+                        browser = page = frame = None
 
-            time.sleep(0.3)
+                await asyncio.sleep(0.3)
 
-    close_browser_quietly(browser)
+        finally:
+            csv_file.close()
+            if browser:
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
+
+
+if __name__ == "__main__":
+    threading.Thread(target=watchdog, daemon=True).start()
+    try:
+        asyncio.run(main_loop())
+    except KeyboardInterrupt:
+        print("\nScraping stopped by user.")
