@@ -1,7 +1,6 @@
 import os
 import time
 import threading
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from datetime import datetime, timedelta, timezone
 from playwright.sync_api import sync_playwright
@@ -65,12 +64,7 @@ def convert_rgb_to_name(rgb_string):
 
 
 def initialize_new_browser_flow(playwright_instance, show_window):
-    """Launch a mobile Chromium and navigate to the game iframe.
-
-    NOTE: No playwright-stealth — it hooks into every page call and was
-    intermittently freezing frame.evaluate() on this container, which is what
-    caused the watchdog to kill the container every ~15 minutes.
-    """
+    """Launch mobile Chromium + navigate to game iframe (no stealth)."""
     browser_obj = playwright_instance.chromium.launch(
         headless=not show_window,
         args=[
@@ -136,8 +130,8 @@ def initialize_new_browser_flow(playwright_instance, show_window):
         raise
 
 
-# --- One-time clean start ---
-RESET_ID = "2026-11-08-no-stealth"
+# --- One-time reset for this version ---
+RESET_ID = "2026-11-08-native-timeout"
 reset_marker = os.path.join(csv_dir or ".", ".reset_id")
 previous_reset = open(reset_marker).read().strip() if os.path.exists(reset_marker) else None
 if previous_reset != RESET_ID:
@@ -149,8 +143,8 @@ if not os.path.exists(csv_filename):
         f.write("timestamp,multiplier,color\n")
 
 
-# --- Watchdog: request a soft browser recycle instead of killing the container ---
-HEARTBEAT_TIMEOUT_SECONDS = 60
+# --- Watchdog (soft reset only) ---
+HEARTBEAT_TIMEOUT_SECONDS = 45
 NO_NEW_ROW_TIMEOUT_SECONDS = 600
 
 heartbeat = {"ok": time.time()}
@@ -167,18 +161,20 @@ def watchdog():
         if size != last_size:
             last_size, last_growth = size, now
         if now - heartbeat["ok"] > HEARTBEAT_TIMEOUT_SECONDS:
-            print(f"WATCHDOG: no heartbeat for {int(now - heartbeat['ok'])}s. Requesting browser recycle.", flush=True)
+            print(f"WATCHDOG: no heartbeat for {int(now - heartbeat['ok'])}s. Recycling browser.", flush=True)
             recycle_requested["flag"] = True
-            heartbeat["ok"] = now  # reset so we don't spam
+            heartbeat["ok"] = now
         if now - last_growth > NO_NEW_ROW_TIMEOUT_SECONDS:
-            print(f"WATCHDOG: no new rows for {int(now - last_growth)}s. Requesting browser recycle.", flush=True)
+            print(f"WATCHDOG: no new rows for {int(now - last_growth)}s. Recycling browser.", flush=True)
             recycle_requested["flag"] = True
             last_growth = now
 
 
 start_csv_server()
 
-HISTORY_JS = """
+# Runs inside the sync-thread's event loop -> no greenlet error.
+# wait_for_function supports a native timeout and returns whatever the JS returns.
+HISTORY_WAIT_JS = """
 () => {
     const wrapper = document.querySelector('.rounds-history-inner-wrapper');
     if (!wrapper) return null;
@@ -198,22 +194,11 @@ HISTORY_JS = """
 }
 """
 
-# Runs frame.evaluate() in a worker thread so a hung iframe cannot block the main loop.
-_eval_pool = ThreadPoolExecutor(max_workers=1)
-
-
-def safe_evaluate(frame, script, timeout=15):
-    future = _eval_pool.submit(frame.evaluate, script)
-    try:
-        return future.result(timeout=timeout)
-    except FutureTimeout:
-        raise RuntimeError("evaluate() timeout — browser hung")
-
-
 BROWSER_ERROR_RESTART_SECONDS = 20
 NO_MULTIPLIER_RESTART_SECONDS = 180
 RELAUNCH_RETRY_SECONDS = 10
 MAX_TRACKED_ROWS = 100
+EVALUATE_TIMEOUT_MS = 15000
 
 
 def close_browser_quietly(browser_obj):
@@ -325,7 +310,20 @@ with sync_playwright() as p:
                     browser = page = frame = None
                     continue
 
-                history_list = safe_evaluate(frame, HISTORY_JS, timeout=15)
+                # Native-timeout evaluate — runs in the sync thread, so no greenlet error.
+                # wait_for_function blocks until the JS returns non-null OR the timeout fires.
+                try:
+                    handle = frame.wait_for_function(
+                        HISTORY_WAIT_JS,
+                        timeout=EVALUATE_TIMEOUT_MS,
+                        polling=300,   # polls every 300 ms internally
+                    )
+                    history_list = handle.json_value() if handle else None
+                except Exception as eval_err:
+                    if "Timeout" in type(eval_err).__name__ or "timeout" in str(eval_err).lower():
+                        raise RuntimeError("evaluate() timeout — browser hung")
+                    raise
+
                 first_error_time = None
 
                 if history_list:
@@ -344,7 +342,7 @@ with sync_playwright() as p:
                         new_rows, overlap_found = find_new_rows(recorded_rows, visible)
                         if overlap_found:
                             if needs_initial_sync and new_rows:
-                                print(f"Recovered {len(new_rows)} round(s) missed while the browser was down.", flush=True)
+                                print(f"Recovered {len(new_rows)} round(s) missed while browser was down.", flush=True)
                             for mult, color_name in new_rows:
                                 write_row(mult, color_name)
                             needs_initial_sync = False
@@ -378,6 +376,6 @@ with sync_playwright() as p:
                     close_browser_quietly(browser)
                     browser = page = frame = None
 
-            time.sleep(0.5)
+            time.sleep(0.3)
 
     close_browser_quietly(browser)
