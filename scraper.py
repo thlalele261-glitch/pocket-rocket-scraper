@@ -1,26 +1,22 @@
 import os
 import time
 import threading
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from datetime import datetime, timedelta, timezone
 from playwright.sync_api import sync_playwright
-from playwright_stealth import Stealth
 
 # --- Railway-friendly configuration ---
 show_browser = os.getenv("SHOW_BROWSER", "false").lower() == "true"
 csv_filename = os.getenv("CSV_PATH", "/data/results.csv")
-# Lesotho time (SAST, UTC+2, no daylight saving)
 LESOTHO_TZ = timezone(timedelta(hours=2))
 
-# Make sure the CSV directory exists (volume mount)
 csv_dir = os.path.dirname(csv_filename)
 if csv_dir and not os.path.exists(csv_dir):
     os.makedirs(csv_dir, exist_ok=True)
 
 
 class CsvHandler(BaseHTTPRequestHandler):
-    """Serves the results CSV so it can be viewed/downloaded from the service's public URL."""
-
     def do_GET(self):
         path = self.path.split("?")[0]
         if path in ("/", "/results.csv"):
@@ -69,7 +65,12 @@ def convert_rgb_to_name(rgb_string):
 
 
 def initialize_new_browser_flow(playwright_instance, show_window):
-    """Safely initializes an isolated mobile layout browser instance with stealth."""
+    """Launch a mobile Chromium and navigate to the game iframe.
+
+    NOTE: No playwright-stealth — it hooks into every page call and was
+    intermittently freezing frame.evaluate() on this container, which is what
+    caused the watchdog to kill the container every ~15 minutes.
+    """
     browser_obj = playwright_instance.chromium.launch(
         headless=not show_window,
         args=[
@@ -78,6 +79,9 @@ def initialize_new_browser_flow(playwright_instance, show_window):
             "--disable-gpu",
             "--disable-extensions",
             "--disable-background-networking",
+            "--disable-features=IsolateOrigins,site-per-process",
+            "--renderer-process-limit=1",
+            "--js-flags=--max-old-space-size=256",
             "--mute-audio",
         ],
     )
@@ -125,7 +129,6 @@ def initialize_new_browser_flow(playwright_instance, show_window):
 
         return browser_obj, context_obj, page_obj, target_frame
     except Exception:
-        # Never leave a half-started browser behind: memory is tight.
         try:
             browser_obj.close()
         except Exception:
@@ -133,14 +136,11 @@ def initialize_new_browser_flow(playwright_instance, show_window):
         raise
 
 
-# One-time clean start: change RESET_ID to wipe the CSV once on the next deploy.
-RESET_ID = "2026-11-07-single-browser"
+# --- One-time clean start ---
+RESET_ID = "2026-11-08-no-stealth"
 reset_marker = os.path.join(csv_dir or ".", ".reset_id")
 previous_reset = open(reset_marker).read().strip() if os.path.exists(reset_marker) else None
 if previous_reset != RESET_ID:
-    if os.path.exists(csv_filename):
-        os.remove(csv_filename)
-        print("Previous results.csv deleted for a clean start.", flush=True)
     with open(reset_marker, "w") as f:
         f.write(RESET_ID)
 
@@ -148,45 +148,68 @@ if not os.path.exists(csv_filename):
     with open(csv_filename, "w", encoding="utf-8") as f:
         f.write("timestamp,multiplier,color\n")
 
-# --- Watchdog: restart the container if scraping silently stalls ---
-# The main loop swallows errors, and a crashed/frozen browser can make it hang forever
-# without exiting, so Railway never restarts it. This thread force-exits so Railway restarts it.
-HEARTBEAT_TIMEOUT_SECONDS = 120    # no successful read of the history list
-NO_NEW_ROW_TIMEOUT_SECONDS = 600   # no new row written to the CSV
+
+# --- Watchdog: request a soft browser recycle instead of killing the container ---
+HEARTBEAT_TIMEOUT_SECONDS = 60
+NO_NEW_ROW_TIMEOUT_SECONDS = 600
+
 heartbeat = {"ok": time.time()}
+recycle_requested = {"flag": False}
 
 
 def watchdog():
     last_size = os.path.getsize(csv_filename) if os.path.exists(csv_filename) else 0
     last_growth = time.time()
     while True:
-        time.sleep(15)
+        time.sleep(10)
         now = time.time()
         size = os.path.getsize(csv_filename) if os.path.exists(csv_filename) else 0
         if size != last_size:
             last_size, last_growth = size, now
         if now - heartbeat["ok"] > HEARTBEAT_TIMEOUT_SECONDS:
-            print(f"WATCHDOG: browser unresponsive for {int(now - heartbeat['ok'])}s. Restarting.", flush=True)
-            os._exit(1)
+            print(f"WATCHDOG: no heartbeat for {int(now - heartbeat['ok'])}s. Requesting browser recycle.", flush=True)
+            recycle_requested["flag"] = True
+            heartbeat["ok"] = now  # reset so we don't spam
         if now - last_growth > NO_NEW_ROW_TIMEOUT_SECONDS:
-            print(f"WATCHDOG: no new rows for {int(now - last_growth)}s. Restarting.", flush=True)
-            os._exit(1)
+            print(f"WATCHDOG: no new rows for {int(now - last_growth)}s. Requesting browser recycle.", flush=True)
+            recycle_requested["flag"] = True
+            last_growth = now
 
 
 start_csv_server()
 
 HISTORY_JS = """
 () => {
-    const items = document.querySelectorAll('.rounds-history-inner-wrapper .history-item');
-    return items.length > 0 ? Array.from(items).map(h => ({
-        mult: (h.innerText || '').trim(),
-        bg: window.getComputedStyle(h).backgroundColor
-    })) : null;
+    const wrapper = document.querySelector('.rounds-history-inner-wrapper');
+    if (!wrapper) return null;
+    const items = wrapper.querySelectorAll('.history-item');
+    if (items.length === 0) return null;
+    const limit = Math.min(items.length, 25);
+    const out = [];
+    for (let i = 0; i < limit; i++) {
+        const h = items[i];
+        let bg = h.style.backgroundColor;
+        if (!bg) {
+            try { bg = window.getComputedStyle(h).backgroundColor; } catch (e) { bg = '-'; }
+        }
+        out.push({ mult: (h.innerText || '').trim(), bg: bg });
+    }
+    return out;
 }
 """
 
-# Restart the (single) browser after this many seconds of continuous read errors,
-# or when no new multiplier has appeared for this long.
+# Runs frame.evaluate() in a worker thread so a hung iframe cannot block the main loop.
+_eval_pool = ThreadPoolExecutor(max_workers=1)
+
+
+def safe_evaluate(frame, script, timeout=15):
+    future = _eval_pool.submit(frame.evaluate, script)
+    try:
+        return future.result(timeout=timeout)
+    except FutureTimeout:
+        raise RuntimeError("evaluate() timeout — browser hung")
+
+
 BROWSER_ERROR_RESTART_SECONDS = 20
 NO_MULTIPLIER_RESTART_SECONDS = 180
 RELAUNCH_RETRY_SECONDS = 10
@@ -206,7 +229,6 @@ def now_str():
 
 
 def load_recent_rows_from_csv():
-    """Seed the de-duplication memory from the CSV so a container restart does not re-write rounds."""
     rows = []
     try:
         with open(csv_filename, "r", encoding="utf-8") as f:
@@ -220,14 +242,6 @@ def load_recent_rows_from_csv():
 
 
 def find_new_rows(recorded, history_oldest_first):
-    """Match what we already recorded against the visible history (overlap) and return the new rows.
-
-    recorded: list of (mult, color) oldest -> newest.
-    history_oldest_first: visible rounds oldest -> newest.
-    Returns (new_rows, overlap_found). We look for the position in the history where our most recent
-    recorded rounds line up (the longest matching tail wins; on a tie the newest position wins) and
-    return everything after it.
-    """
     best_end, best_len = None, 0
     for end in range(len(history_oldest_first) - 1, -1, -1):
         length = 0
@@ -239,8 +253,6 @@ def find_new_rows(recorded, history_oldest_first):
             length += 1
         if length == 0:
             continue
-        # Valid if the match runs back to the start of the visible history, covers every round we
-        # have recorded, or is at least 3 rounds long (a strong enough signature on its own).
         if length == end + 1 or length == len(recorded) or length >= 3:
             if length > best_len:
                 best_end, best_len = end, length
@@ -249,11 +261,7 @@ def find_new_rows(recorded, history_oldest_first):
     return history_oldest_first[best_end + 1:], True
 
 
-with Stealth().use_sync(sync_playwright()) as p:
-    # Only ONE browser is ever open (memory is limited). If it crashes, stops responding, or no new
-    # multiplier appears for 3 minutes, it is closed and a fresh one is started; the CSV is never
-    # touched. On every (re)start the whole visible history is read and matched against what is
-    # already recorded, so rounds missed during the outage are filled in without duplicates.
+with sync_playwright() as p:
     browser = page = frame = None
     page_state = {"crashed": False}
     recorded_rows = load_recent_rows_from_csv()
@@ -280,9 +288,17 @@ with Stealth().use_sync(sync_playwright()) as p:
 
         while True:
             try:
+                # --- Watchdog requested a soft recycle ---
+                if recycle_requested["flag"]:
+                    recycle_requested["flag"] = False
+                    print("Recycling browser per watchdog request.", flush=True)
+                    close_browser_quietly(browser)
+                    browser = page = frame = None
+                    continue
+
                 # --- (Re)start the single browser when there is none ---
                 if browser is None:
-                    heartbeat["ok"] = time.time()  # launching can take a while
+                    heartbeat["ok"] = time.time()
                     browser_launches += 1
                     print(f"Launching browser (start #{browser_launches})...", flush=True)
                     try:
@@ -303,26 +319,23 @@ with Stealth().use_sync(sync_playwright()) as p:
                 if page_state["crashed"] or page.is_closed() or not browser.is_connected():
                     raise RuntimeError("browser or page crashed")
 
-                # --- No multiplier for 3 minutes: replace the browser ---
                 if time.time() - last_new_row_time > NO_MULTIPLIER_RESTART_SECONDS:
-                    print(f"No new multiplier for {NO_MULTIPLIER_RESTART_SECONDS}s. Closing browser and starting a fresh one.", flush=True)
+                    print(f"No new multiplier for {NO_MULTIPLIER_RESTART_SECONDS}s. Recycling browser.", flush=True)
                     close_browser_quietly(browser)
                     browser = page = frame = None
                     continue
 
-                history_list = frame.evaluate(HISTORY_JS)
+                history_list = safe_evaluate(frame, HISTORY_JS, timeout=15)
                 first_error_time = None
 
                 if history_list:
                     heartbeat["ok"] = time.time()
-                    # Newest is index 0 on the page; reverse so we always work oldest -> newest.
                     visible = [
                         (item["mult"].replace("x", "").strip(), convert_rgb_to_name(item["bg"]))
                         for item in reversed(history_list)
                     ]
 
                     if not recorded_rows:
-                        # Nothing recorded yet: ingest the entire visible history, oldest first.
                         print(f"Empty file: writing all {len(visible)} visible rounds.", flush=True)
                         for mult, color_name in visible:
                             write_row(mult, color_name)
@@ -336,13 +349,10 @@ with Stealth().use_sync(sync_playwright()) as p:
                                 write_row(mult, color_name)
                             needs_initial_sync = False
                         elif needs_initial_sync:
-                            # Gap is longer than the visible history: everything visible is newer, keep all of it.
-                            print(f"No overlap with recorded rounds after restart: writing all {len(visible)} visible rounds.", flush=True)
+                            print(f"No overlap after restart: writing all {len(visible)} visible rounds.", flush=True)
                             for mult, color_name in visible:
                                 write_row(mult, color_name)
                             needs_initial_sync = False
-                        # else: no overlap in steady state (e.g. a half-rendered read). Do not close the
-                        # browser; just keep polling. The 3-minute no-multiplier rule is the safety net.
 
                     if len(recorded_rows) > MAX_TRACKED_ROWS:
                         del recorded_rows[:-MAX_TRACKED_ROWS]
@@ -359,14 +369,15 @@ with Stealth().use_sync(sync_playwright()) as p:
                     first_error_time = now_err
                 browser_dead = (
                     page_state["crashed"]
-                    or "crashed" in str(loop_err)
+                    or "crashed" in str(loop_err).lower()
                     or "closed" in str(loop_err).lower()
+                    or "timeout" in str(loop_err).lower()
                 )
                 if browser_dead or now_err - first_error_time > BROWSER_ERROR_RESTART_SECONDS:
-                    print("Browser crashed or unresponsive. Closing it and starting a fresh one (data kept).", flush=True)
+                    print("Browser crashed or unresponsive. Recycling (data kept).", flush=True)
                     close_browser_quietly(browser)
                     browser = page = frame = None
 
-            time.sleep(0.3)
+            time.sleep(0.5)
 
     close_browser_quietly(browser)
